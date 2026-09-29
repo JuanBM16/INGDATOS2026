@@ -13,15 +13,15 @@ jobs:
     - name: Install jq & curl
       run: sudo apt-get update && sudo apt-get install -y jq curl
 
-    - name: Export multiple notebooks (raw)
+    - name: Export notebooks (raw)
       run: |
         ORIGIN_HOST=${{ secrets.DATABRICKS_ORIGIN_HOST }}
         ORIGIN_TOKEN=${{ secrets.DATABRICKS_ORIGIN_TOKEN }}
-        NOTEBOOK_BASE="/Workspace/Users/juansmartdt99@outlook.com/INGDATOS2026"
-        NOTEBOOKS=("Ntbk_1" "Ntbk_2")  # Agrega más según necesites
+        NOTEBOOK_BASE="/Workspace/Users/juansmartdt99@outlook.com/INGDATOS2026/proceso"
+        NOTEBOOKS=("00_funciones" "00_prepamb" "01_ingest_admisiones" "02_ingest_hospitales" "03_ingest_hcahps" "04_transform" "05_load" "06_grants")
         mkdir -p notebooks_to_deploy
         for nb in "${NOTEBOOKS[@]}"; do
-          echo "Exportando $nb en modo raw..."
+          echo "Exportando $nb..."
           curl -s -X GET \
             -H "Authorization: Bearer $ORIGIN_TOKEN" \
             "$ORIGIN_HOST/api/2.0/workspace/export?path=$NOTEBOOK_BASE/$nb&format=SOURCE&direct_download=true" \
@@ -33,7 +33,6 @@ jobs:
         DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
         DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
         DEST_BASE="/py/scripts/main"
-        echo "Creando carpeta $DEST_BASE si no existe..."
         curl -s -X POST \
           -H "Authorization: Bearer $DEST_TOKEN" \
           -H "Content-Type: application/json" \
@@ -59,94 +58,124 @@ jobs:
       run: |
         DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
         DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
-        WORKFLOW_NAME="WF_ADB"
-
-        echo "Verificando si existe el workflow: $WORKFLOW_NAME"
-
-        # Buscar por nombre (filtro nativo de la API)
+        WORKFLOW_NAME="WF_ETL_SALUD"
         workflows_response=$(curl -s -G \
           -H "Authorization: Bearer $DEST_TOKEN" \
           --data-urlencode "name=$WORKFLOW_NAME" \
           "$DEST_HOST/api/2.1/jobs/list")
-
         existing_job_ids=$(echo "$workflows_response" | jq -r --arg name "$WORKFLOW_NAME" '.jobs[]? | select(.settings.name == $name) | .job_id')
-
         if [ -n "$existing_job_ids" ]; then
           for existing_job_id in $existing_job_ids; do
-            echo "Workflow encontrado con ID: $existing_job_id. Eliminando..."
-            delete_response=$(curl -s -X POST \
+            echo "Eliminando workflow existente: $existing_job_id"
+            curl -s -X POST \
               -H "Authorization: Bearer $DEST_TOKEN" \
               -H "Content-Type: application/json" \
               -d "{\"job_id\": $existing_job_id}" \
-              "$DEST_HOST/api/2.1/jobs/delete")
-            echo "Delete response: $delete_response"
+              "$DEST_HOST/api/2.1/jobs/delete"
           done
-        else
-          echo "No se encontró workflow existente con nombre: $WORKFLOW_NAME"
         fi
 
-    - name: Create Databricks Workflow WF_ADB (Serverless)
+    - name: Create Databricks Workflow WF_ETL_SALUD (Serverless)
       run: |
         DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
         DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
         DEST_BASE="/py/scripts/main"
 
-        echo "Creando workflow: WF_ADB con serverless compute"
-
-        # Sin existing_cluster_id / new_cluster / job_cluster_key => las tareas corren en serverless
         cat > workflow_config.json << EOF
         {
-          "name": "WF_ADB",
+          "name": "WF_ETL_SALUD",
           "format": "MULTI_TASK",
           "performance_target": "STANDARD",
           "tasks": [
             {
-              "task_key": "tarea1_notebook1",
-              "description": "Ejecuta notebook ntbk_1",
+              "task_key": "prepamb",
               "notebook_task": {
-                "notebook_path": "$DEST_BASE/ntbk_1",
-                "source": "WORKSPACE"
+                "notebook_path": "$DEST_BASE/00_prepamb",
+                "source": "WORKSPACE",
+                "base_parameters": { "ambiente": "prod", "storage": "azdatasmart03", "credencial": "cred_salud" }
               },
               "timeout_seconds": 3600,
-              "max_retries": 2
+              "max_retries": 1
             },
             {
-              "task_key": "tarea2_notebook2",
-              "description": "Ejecuta notebook ntbk_2",
+              "task_key": "ingest_admisiones",
+              "depends_on": [{ "task_key": "prepamb" }],
               "notebook_task": {
-                "notebook_path": "$DEST_BASE/ntbk_2",
-                "source": "WORKSPACE"
+                "notebook_path": "$DEST_BASE/01_ingest_admisiones",
+                "source": "WORKSPACE",
+                "base_parameters": { "ambiente": "prod", "storage": "azdatasmart03" }
               },
               "timeout_seconds": 3600,
-              "max_retries": 2,
+              "max_retries": 1
+            },
+            {
+              "task_key": "ingest_hospitales",
+              "depends_on": [{ "task_key": "prepamb" }],
+              "notebook_task": {
+                "notebook_path": "$DEST_BASE/02_ingest_hospitales",
+                "source": "WORKSPACE",
+                "base_parameters": { "ambiente": "prod", "storage": "azdatasmart03" }
+              },
+              "timeout_seconds": 3600,
+              "max_retries": 1
+            },
+            {
+              "task_key": "ingest_hcahps",
+              "depends_on": [{ "task_key": "prepamb" }],
+              "notebook_task": {
+                "notebook_path": "$DEST_BASE/03_ingest_hcahps",
+                "source": "WORKSPACE",
+                "base_parameters": { "ambiente": "prod", "storage": "azdatasmart03" }
+              },
+              "timeout_seconds": 3600,
+              "max_retries": 1
+            },
+            {
+              "task_key": "transform",
               "depends_on": [
-                { "task_key": "tarea1_notebook1" }
-              ]
+                { "task_key": "ingest_admisiones" },
+                { "task_key": "ingest_hospitales" },
+                { "task_key": "ingest_hcahps" }
+              ],
+              "notebook_task": {
+                "notebook_path": "$DEST_BASE/04_transform",
+                "source": "WORKSPACE",
+                "base_parameters": { "ambiente": "prod", "storage": "azdatasmart03" }
+              },
+              "timeout_seconds": 3600,
+              "max_retries": 1
+            },
+            {
+              "task_key": "load",
+              "depends_on": [{ "task_key": "transform" }],
+              "notebook_task": {
+                "notebook_path": "$DEST_BASE/05_load",
+                "source": "WORKSPACE",
+                "base_parameters": { "ambiente": "prod", "storage": "azdatasmart03" }
+              },
+              "timeout_seconds": 3600,
+              "max_retries": 1
+            },
+            {
+              "task_key": "grants",
+              "depends_on": [{ "task_key": "load" }],
+              "notebook_task": {
+                "notebook_path": "$DEST_BASE/06_grants",
+                "source": "WORKSPACE",
+                "base_parameters": { "ambiente": "prod", "grupo": "account users" }
+              },
+              "timeout_seconds": 3600,
+              "max_retries": 1
             }
           ],
-          "schedule": {
-            "quartz_cron_expression": "0 0 8 * * ?",
-            "timezone_id": "America/Lima",
-            "pause_status": "PAUSED"
-          },
-          "email_notifications": {
-            "on_failure": [],
-            "on_success": [],
-            "no_alert_for_skipped_runs": false
-          },
+          "email_notifications": { "on_failure": [], "on_success": [], "no_alert_for_skipped_runs": false },
           "timeout_seconds": 7200,
           "max_concurrent_runs": 1,
-          "tags": {
-            "environment": "production",
-            "created_by": "github_actions",
-            "project": "automated_deployment",
-            "compute": "serverless"
-          }
+          "tags": { "environment": "production", "created_by": "github_actions", "project": "etl_salud", "compute": "serverless" }
         }
         EOF
 
-        # Validar que el JSON generado sea correcto
-        jq empty workflow_config.json || { echo " JSON inválido"; cat workflow_config.json; exit 1; }
+        jq empty workflow_config.json || { echo "JSON inválido"; cat workflow_config.json; exit 1; }
 
         create_response=$(curl -s -X POST \
           -H "Authorization: Bearer $DEST_TOKEN" \
@@ -155,71 +184,52 @@ jobs:
           "$DEST_HOST/api/2.1/jobs/create")
 
         echo "Workflow creation response: $create_response"
-
         job_id=$(echo "$create_response" | jq -r '.job_id')
 
         if [ "$job_id" != "" ] && [ "$job_id" != "null" ]; then
-          echo "Workflow 'WF_ADB' creado exitosamente con ID: $job_id"
+          echo "Workflow creado con ID: $job_id"
           echo "JOB_ID=$job_id" >> $GITHUB_ENV
         else
           echo "Error al crear el workflow"
-          echo "Si el error menciona compute/cluster, verifica que el workspace tenga Unity Catalog y serverless for workflows habilitado."
-          echo "Response completo: $create_response"
           exit 1
         fi
 
-    - name: Validate Workflow Configuration
+    - name: Run Workflow Now and Wait
       run: |
         DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
         DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
         JOB_ID="${{ env.JOB_ID }}"
 
-        echo "Validando la configuración del workflow creado (ID: $JOB_ID)..."
-
-        job_details=$(curl -s -X GET \
+        run_response=$(curl -s -X POST \
           -H "Authorization: Bearer $DEST_TOKEN" \
-          "$DEST_HOST/api/2.1/jobs/get?job_id=$JOB_ID")
+          -H "Content-Type: application/json" \
+          -d "{\"job_id\": $JOB_ID}" \
+          "$DEST_HOST/api/2.1/jobs/run-now")
 
-        if [ "$(echo "$job_details" | jq -r '.job_id // empty')" = "" ]; then
-          echo "No se pudo obtener el workflow creado"
-          echo "$job_details"
+        run_id=$(echo "$run_response" | jq -r '.run_id')
+        echo "Run ID: $run_id"
+
+        for i in $(seq 1 30); do
+          sleep 20
+          status=$(curl -s -X GET \
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            "$DEST_HOST/api/2.1/jobs/runs/get?run_id=$run_id")
+          life_state=$(echo "$status" | jq -r '.state.life_cycle_state')
+          result_state=$(echo "$status" | jq -r '.state.result_state // "PENDING"')
+          echo "Intento $i: life_cycle_state=$life_state result_state=$result_state"
+          if [ "$life_state" = "TERMINATED" ] || [ "$life_state" = "SKIPPED" ] || [ "$life_state" = "INTERNAL_ERROR" ]; then
+            break
+          fi
+        done
+
+        if [ "$result_state" != "SUCCESS" ]; then
+          echo "La ejecución no terminó en éxito: $result_state"
           exit 1
         fi
-
-        echo "Resumen del workflow:"
-        echo "Nombre: $(echo "$job_details" | jq -r '.settings.name')"
-        echo "Número de tareas: $(echo "$job_details" | jq '.settings.tasks | length')"
-        echo ""
-        echo "Tareas configuradas:"
-        echo "$job_details" | jq -r '.settings.tasks[] | "- " + .task_key + " → " + .notebook_task.notebook_path'
-        echo ""
-        echo "Cómputo por tarea:"
-        echo "$job_details" | jq -r '.settings.tasks[] | "- " + .task_key + " → " + (if (.existing_cluster_id or .new_cluster or .job_cluster_key) then "cluster clásico" else "serverless" end)'
-        echo "Performance target: $(echo "$job_details" | jq -r '.settings.performance_target // "STANDARD"')"
-
-        # Fallar si alguna tarea quedó con cluster clásico
-        classic=$(echo "$job_details" | jq '[.settings.tasks[] | select(.existing_cluster_id or .new_cluster or .job_cluster_key)] | length')
-        if [ "$classic" != "0" ]; then
-          echo "Hay $classic tarea(s) que no usan serverless"
-          exit 1
-        fi
+        echo "Ejecución exitosa del workflow WF_ETL_SALUD"
 
     - name: Clean up
       if: always()
       run: |
         rm -rf notebooks_to_deploy
         rm -f workflow_config.json
-
-    - name: Done
-      run: |
-        echo "¡Despliegue completado exitosamente!"
-        echo ""
-        echo "Resumen:"
-        echo "Notebooks desplegados: ntbk_1, ntbk_2"
-        echo "Workflow creado: WF_ADB (ID: ${{ env.JOB_ID }})"
-        echo "Tareas configuradas:"
-        echo "   - tarea1_notebook1 (ntbk_1)"
-        echo "   - tarea2_notebook2 (ntbk_2)"
-        echo "Cómputo: serverless (performance_target: STANDARD)"
-        echo ""
-        echo "🔗 Accede a tu workspace de Databricks para ver el workflow en la sección 'Jobs & Pipelines'"
